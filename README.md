@@ -1,5 +1,5 @@
 # BioPod docker images
 
-Docker Hub [:link:](https://hub.docker.com/repository/docker/biopod/biopod/general)
+Docker Hub [:link:](https://hub.docker.com/u/biopod)
 
-amber:22.22
+biopod:0.0.1

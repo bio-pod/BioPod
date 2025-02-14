@@ -1,0 +1,300 @@
+# syntax=docker/dockerfile:1
+FROM nvidia/cuda:11.0.3-cudnn8-devel-ubuntu20.04 AS build
+LABEL Description="biopod:0.0.1 build"
+ARG BIOPOD_VER="0.0.1"
+
+ENV TZ=America/Chicago \
+    DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda
+
+WORKDIR /app
+SHELL ["/bin/bash", "-c"]
+RUN apt-get update && \
+    apt-get -y --no-install-recommends install \
+    apt-utils vim tcsh wget git unzip bzip2 sudo gawk \
+    make cmake gcc g++ gdb gfortran build-essential \
+    python python3 faketime expect \
+    openmpi-bin libopenmpi-dev openssh-client \
+    flex bison patch bc \
+    xorg-dev libz-dev libbz2-dev libpopt0 libpopt-dev libcppunit-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+    # ca-certificates \
+    #libx11-dev libpython2.7 libsm6 libxext6 libxrender-dev && \
+
+#################
+#  amber:22.22  #
+#################
+
+COPY ./packages/${BIOPOD_VER}/amber/22.22/Amber22.tar.bz2 \
+     ./packages/${BIOPOD_VER}/amber/22.22/AmberTools22.tar.bz2 /app/
+
+RUN tar xfj Amber22.tar.bz2 && rm Amber22.tar.bz2 && \
+    tar xfj AmberTools22.tar.bz2 && rm AmberTools22.tar.bz2
+
+# fix amber python error: http://archive.ambermd.org/202307/0077.html
+RUN sed -i '/set(MINICONDA_INSTALLER_FILENAME "Miniconda${PYTHON_MAJOR_RELEASE}/i\\tset(MINICONDA_VERSION py310_23.5.2-0)' \
+    /app/amber22_src/cmake/UseMiniconda.cmake
+
+# serial - cpu
+RUN cd amber22_src/build && \
+    ./run_cmake && \
+    make install
+
+ENV AMBERHOME=/app/amber22 \
+    PATH=/app/amber22/bin:${PATH} \
+    LD_LIBRARY_PATH=/app/amber22/lib:${LD_LIBRARY_PATH} \
+    PERL5LIB=/app/amber22/lib/perl:${PERL5LIB} \
+    PYTHONPATH=/app/amber22/lib/python3.10/site-packages:${PYTHONPATH} \
+    QUICK_BASIS=/app/amber22/AmberTools/src/quick/basis \
+    OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+# parallel - cpu
+RUN cd amber22_src/build && \
+    sed -i 's/-DMPI=FALSE/-DMPI=TRUE/g' run_cmake && \
+    sed -i 's/-DCUDA=TRUE/-DCUDA=FALSE/g' run_cmake && \
+    ./run_cmake && \
+    make install
+
+# serial - gpu
+RUN cd amber22_src/build && \
+    sed -i 's/-DMPI=TRUE/-DMPI=FALSE/g' run_cmake && \
+    sed -i 's/-DCUDA=FALSE/-DCUDA=TRUE/g' run_cmake && \
+    ./run_cmake && \
+    make install
+
+# parallel + gpu
+RUN cd amber22_src/build && \
+    sed -i 's/-DMPI=FALSE/-DMPI=TRUE/g' run_cmake && \
+    sed -i 's/-DCUDA=FALSE/-DCUDA=TRUE/g' run_cmake && \
+    ./run_cmake && \
+    make install
+
+# try to fix error in ./py_resp_test.run and ./Run.bar_pbsa
+RUN /app/amber22/miniconda/bin/python3.10 -m pip install pyopenssl cryptography --upgrade
+
+RUN rm -r /app/amber22_src
+RUN chmod -R 777 /app/amber22
+
+# Generate test scripts
+RUN mkdir -p /app/test/amber22
+RUN cd /app/test/amber22 && echo '#!/usr/bin/env bash' > test.sh && \
+    echo 'mkdir -p /mnt/biopod.amber.22.22.test' >> test.sh && \
+    echo 'cd $AMBERHOME && make test.serial > /mnt/biopod.amber.22.22.test/log.test.serial 2>&1' >> test.sh && \
+    echo 'cd $AMBERHOME && export CUDA_VISIBLE_DEVICES=0 && make test.cuda.serial > /mnt/biopod.amber.22.22.test/log.test.cuda.serial 2>&1' >> test.sh && \
+    echo 'cd $AMBERHOME && export DO_PARALLEL="mpirun -np 2" && make test.parallel > /mnt/biopod.amber.22.22.test/log.test.parallel.2 2>&1' >> test.sh && \
+    echo 'cd $AMBERHOME && export DO_PARALLEL="mpirun -np 4" && make test.parallel > /mnt/biopod.amber.22.22.test/log.test.parallel.4 2>&1' >> test.sh && \
+    echo 'cd $AMBERHOME && export DO_PARALLEL="mpirun -np 2" && make test.cuda.parallel > /mnt/biopod.amber.22.22.test/log.test.cuda.parallel 2>&1' >> test.sh && \
+    echo 'cp -ra /app/amber22/logs /mnt/biopod.amber.22.22.test/' >> test.sh && \
+    chmod -R 777 test.sh
+
+# ##############################
+# #  miniconda:24.7.1-0-py312  #
+# ##############################
+##############################
+#  miniconda:24.11.1-0-py39  #
+##############################
+
+#COPY ./packages/${BIOPOD_VER}/miniconda/24.7.1-0-py312/Miniconda3-py312_24.7.1-0-Linux-x86_64.sh /app/
+#RUN cd /app/ && /bin/bash ./Miniconda3-py312_24.7.1-0-Linux-x86_64.sh -b -p /app/miniconda
+COPY ./packages/${BIOPOD_VER}/miniconda/24.11.1-0-py39/Miniconda3-py39_24.11.1-0-Linux-x86_64.sh /app/
+RUN cd /app/ && /bin/bash ./Miniconda3-py39_24.11.1-0-Linux-x86_64.sh -b -p /app/miniconda
+ENV PATH=/app/miniconda/bin:${PATH}
+#RUN rm ./Miniconda3-py312_24.7.1-0-Linux-x86_64.sh
+RUN rm ./Miniconda3-py39_24.11.1-0-Linux-x86_64.sh
+RUN conda update -n base conda
+RUN conda install -n base conda-libmamba-solver
+RUN conda config --set solver libmamba
+
+###############
+#  dock:6.10  #
+###############
+
+COPY ./packages/${BIOPOD_VER}/dock/6.10/dock.6.10_source.tar.gz \
+     ./packages/${BIOPOD_VER}/dock/6.10/dms.zip \
+     ./packages/${BIOPOD_VER}/dock/6.10/sphgen_cpp.1.2.tar.gz /app/
+
+RUN cd /app && \
+    tar -xzf dock.6.10_source.tar.gz && rm dock.6.10_source.tar.gz && \
+    unzip dms.zip && rm dms.zip && \
+    tar -xzf sphgen_cpp.1.2.tar.gz && rm sphgen_cpp.1.2.tar.gz
+
+RUN cd /app/dock6/install && ./configure gnu && make all
+RUN cd /app/sphgen_cpp.1.2 && make
+RUN cd /app/dms && make install
+RUN cp /app/sphgen_cpp.1.2/sphgen_cpp /usr/local/bin/
+
+RUN chmod -R 777 /app/dock6 /app/dms /app/sphgen_cpp.1.2
+
+RUN mkdir -p /app/test/dock6
+RUN cd /app/test/dock6 && echo '#!/usr/bin/env bash' > test.sh && \
+    echo 'mkdir -p /mnt/biopod.dock6.test' >> test.sh && \
+    echo 'unset AMBERHOME' >> test.sh && \
+    echo 'cd /app/dock6/install && make test > /mnt/biopod.dock6.test/log.test 2>&1' >> test.sh && \
+    chmod -R 777 test.sh
+ENV PATH=/app/dock6/bin:${PATH}
+
+####################
+#  mgltools:1.5.7  #
+####################
+
+COPY ./packages/${BIOPOD_VER}/mgltools/1.5.7/mgltools_x86_64Linux2_1.5.7.tar_.gz \
+     ./packages/${BIOPOD_VER}/mgltools/1.5.7/mgltools_x86_64Linux2_1.5.7p1.tar.gz /app/
+
+RUN cd /app && \
+    tar -xzf mgltools_x86_64Linux2_1.5.7.tar_.gz && rm mgltools_x86_64Linux2_1.5.7.tar_.gz && \
+    tar -xzf mgltools_x86_64Linux2_1.5.7p1.tar.gz && rm mgltools_x86_64Linux2_1.5.7p1.tar.gz
+
+RUN mkdir mgltools
+# Install MGLTools
+RUN cd /app/mgltools_x86_64Linux2_1.5.7 && \
+    ./install.sh -d /app/mgltools
+RUN rm -r /app/mgltools_x86_64Linux2_1.5.7
+RUN chmod -R 777 /app/mgltools
+ENV PATH=/app/mgltools/bin:${PATH} \
+    ADT_util=/app/mgltools/MGLToolsPckgs/AutoDockTools/Utilities24/
+
+####################
+#  autodock:4.2.6  #
+####################
+
+COPY ./packages/${BIOPOD_VER}/autodock/4.2.6/autodocksuite-4.2.6-x86_64Linux2.tar /app/
+
+RUN cd /app && \
+    tar -xf autodocksuite-4.2.6-x86_64Linux2.tar && rm autodocksuite-4.2.6-x86_64Linux2.tar
+
+RUN mkdir autodock
+# Install autodocksuite
+RUN mv /app/x86_64Linux2 /app/autodock/autodocksuite
+RUN chmod -R 777 /app/autodock
+ENV PATH=/app/autodock/autodocksuite:${PATH}
+
+################
+#  vina:1.1.2  #
+################
+
+RUN mkdir vina
+COPY ./packages/${BIOPOD_VER}/vina/1.1.2/vina_mod ./packages/${BIOPOD_VER}/vina/1.1.2/vina /app/vina/
+RUN chmod -R 777 /app/vina
+ENV PATH=/app/vina:${PATH}
+
+##################
+#  rdock:2013.1  #
+##################
+
+RUN mkdir rdock
+COPY ./packages/${BIOPOD_VER}/rdock/2024.04.204-legacy/rDock-24.04.204-legacy.tar.gz /app/rdock/
+
+RUN cd /app/rdock && \
+    tar -xzf rDock-24.04.204-legacy.tar.gz  && \
+    rm /app/rdock/rDock-24.04.204-legacy.tar.gz && \
+    cd ./rDock-24.04.204-legacy && \
+    make && PREFIX=/app/rdock make install
+
+RUN chmod -R 777 /app/rdock
+
+RUN mkdir -p /app/test/rdock
+RUN cd /app/test/rdock && echo '#!/usr/bin/env bash' > test.sh && \
+    echo 'mkdir -p /mnt/biopod.rdock.test' >> test.sh && \
+    echo 'cd /app/rdock/rDock-24.04.204-legacy && make test > /mnt/biopod.rdock.test/log.test 2>&1' >> test.sh && \
+    chmod -R 777 test.sh
+
+ENV RBT_ROOT=/app/rdock/ \
+    LD_LIBRARY_PATH=/app/rdock/lib:${LD_LIBRARY_PATH} \
+    PATH=/app/rdock/bin:${PATH}
+
+####################
+#  chimera:1.17.3  #
+####################
+
+RUN mkdir chimera
+COPY ./packages/${BIOPOD_VER}/chimera/1.17.3/chimera-1.17.3-linux_x86_64_osmesa.bin /app/chimera/
+COPY ./packages/${BIOPOD_VER}/chimera/1.17.3/chimera_expect /app/chimera/
+
+RUN cd /app/chimera && ./chimera_expect && \
+    rm /app/chimera/chimera-1.17.3-linux_x86_64_osmesa.bin
+RUN mv /opt/UCSF/Chimera64-1.17.3/* /app/chimera/
+
+RUN chmod -R 777 /app/chimera
+RUN ln -s /app/chimera/bin/chimera /usr/local/bin/chimera
+
+RUN mkdir -p /app/test/chimera
+RUN cd /app/test/chimera && echo '#!/usr/bin/env bash' > test.sh && \
+    echo 'mkdir -p /mnt/biopod.chimera.test' >> test.sh && \
+    echo 'run_chimera_test > /mnt/biopod.chimera.test/log.test 2>&1' >> test.sh && \
+    chmod -R 777 test.sh
+
+#######################################################################
+#  openeye-toolkits:2021.2.0 rdkit:2024.03.5 numpy:2.0.2              #
+#  scipy:1.13.1 pymol-open-source:3.0.0 pyyaml                        #
+#######################################################################
+
+#RUN conda install -y -q -c openeye openeye-toolkits=2024.1.0
+RUN conda install -y -q -c openeye openeye-toolkits=2021.2.0
+RUN conda install -y -q -c conda-forge pymol-open-source=3.0.0
+RUN conda install -y -q -c conda-forge scipy=1.13.1
+RUN conda install -y -q -c conda-forge numpy=2.0.2
+RUN conda install -y -q -c conda-forge rdkit=2024.03.5
+RUN conda install -y -q -c conda-forge pyyaml
+
+# ##########################################################################
+
+# Generate final test scripts
+RUN cd /app/test/ && echo '#!/usr/bin/env bash' > test.sh && \
+    echo 'cd amber22 && bash test.sh && cd -' >> test.sh && \
+    echo 'cd dock6 && bash test.sh && cd -' >> test.sh && \
+    echo 'cd rdock && bash test.sh && cd -' >> test.sh
+
+RUN mkdir -p /app/license
+ENV OE_LICENSE=/app/license/oe_license.txt
+
+# ##########################################################################
+RUN mkdir -p /app/examples
+COPY ./examples/ /app/examples/
+RUN chmod -R 777 /app/test
+# ##########################################################################
+
+# ##########################################################################
+# ##########################################################################
+
+FROM nvidia/cuda:11.0.3-cudnn8-devel-ubuntu20.04 AS runtime
+LABEL Description="biopod:0.0.1 runtime"
+ARG BIOPOD_VER="0.0.1"
+
+ENV TZ=America/Chicago \
+    DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda
+
+WORKDIR /mnt
+SHELL ["/bin/bash", "-c"]
+RUN apt-get update && \
+    apt-get -y --no-install-recommends install \
+    apt-utils vim tcsh wget git unzip bzip2 sudo gawk \
+    make cmake gcc g++ gdb gfortran build-essential \
+    python python3 faketime expect \
+    openmpi-bin libopenmpi-dev openssh-client \
+    flex bison patch bc \
+    xorg-dev libz-dev libbz2-dev libpopt0 libpopt-dev libcppunit-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /app/ /app/
+COPY --from=build /usr/local/lib/ /usr/local/lib/
+COPY --from=build /usr/local/bin/ /usr/local/bin/
+
+ENV AMBERHOME=/app/amber22 \
+    LD_LIBRARY_PATH=/app/amber22/lib:/app/rdock/lib:${LD_LIBRARY_PATH} \
+    PERL5LIB=/app/amber22/lib/perl:${PERL5LIB} \
+    PYTHONPATH=/app/amber22/lib/python3.10/site-packages:${PYTHONPATH} \
+    QUICK_BASIS=/app/amber22/AmberTools/src/quick/basis \
+    OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    ADT_util=/app/mgltools/MGLToolsPckgs/AutoDockTools/Utilities24/ \
+    RBT_ROOT=/app/rdock/
+ENV PATH=/app/miniconda/bin:/app/amber22/bin:/app/dock6/bin:/app/mgltools/bin:/app/autodock/autodocksuite:/app/vina:/app/rdock/bin:${PATH}
+ENV OE_LICENSE=/app/license/oe_license.txt
+# RUN ln -s /usr/bin/python3 /usr/bin/python
+#     #ln -s /usr/bin/pip3 /usr/bin/pip
+
